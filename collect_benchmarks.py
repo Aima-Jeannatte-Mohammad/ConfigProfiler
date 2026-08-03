@@ -50,19 +50,18 @@ watts ci-dessus), en réponse à "comment aller plus loin pour un jury exigeant"
        throttled comme plus fiable qu'il ne l'est si cette lecture échoue
        silencieusement en repli sur 0.0.
 
-⚠️ TODO AVANT LA VRAIE COLLECTE — un point restant (le flag --cpu_threads a
-été confirmé, et la mesure watts corrigée par échantillonnage — voir
-EXECUTION_LOG.md) :
+⚠️ TODO AVANT LA VRAIE COLLECTE — un seul point restant :
     1. Mapping quantization -> fichier .pte : à ce jour, un seul .pte existe
        sur le device (qwen3_0_6b.pte, config qwen3_xnnpack_q8da4w). Pour une
        vraie matrice int8/int4, il faut exporter et pousser un .pte distinct
        par niveau de quantization avant de lancer la collecte complète.
-    2. Mode "thinking" de Qwen3 (balises <think>...) actif par défaut dans le
-       texte généré — n'affecte pas le parsing des métriques (JSON séparé du
-       texte), mais génère des tokens supplémentaires qui gonflent le nombre
-       de tokens/latence mesurés. Décision à prendre : le désactiver via le
-       chat template avant la collecte, ou l'assumer et le documenter comme
-       partie du protocole. Non tranché à ce stade — voir EXECUTION_LOG.md.
+
+DÉCISION TRANCHÉE (n'est plus un TODO) : mode "thinking" de Qwen3 désactivé
+via le soft switch "/no_think" ajouté à chaque prompt utilisateur. Raison :
+pollue la démo vidéo (séquence C) et fausse les métriques de tokens/latence
+du dataset de fidélité jargon sans apporter de valeur au projet (on mesure la
+fidélité de traduction, pas la qualité du raisonnement interne). Voir
+EXECUTION_LOG.md pour la discussion complète.
 
 Aucune dépendance externe : Python 3.8+, adb dans le PATH, USB ou débogage
 sans fil activé.
@@ -547,6 +546,15 @@ def build_llama_main_command(quantization: str, threads: Optional[int], prompt: 
     aussi bien -cpu_threads=N que --cpu_threads=N (testé avec --tokenizer_path
     dans les runs précédents) — on garde le style double-tiret pour la
     cohérence avec le reste du projet.
+
+    DÉCISION Jour 2 (tranchée, voir EXECUTION_LOG.md) : mode "thinking" de
+    Qwen3 désactivé via le soft switch "/no_think" ajouté au message
+    utilisateur. Le hard switch (enable_thinking=False) est une option
+    Python côté tokenizer HuggingFace (apply_chat_template), inutilisable
+    depuis ce runner C++ qui construit le prompt en texte brut — le soft
+    switch textuel est donc la seule option disponible ici. Confirmé
+    fonctionnel pour Qwen3 (pas Qwen3-VL, pas Qwen3.5, qui ont un
+    comportement différent).
     """
     if quantization not in QUANT_TO_PTE:
         raise ValueError(
@@ -555,7 +563,7 @@ def build_llama_main_command(quantization: str, threads: Optional[int], prompt: 
             f"Exporter et pousser le .pte manquant avant de continuer (TODO #2)."
         )
     pte_filename = QUANT_TO_PTE[quantization]
-    templated_prompt = f"<|im_start|>user {prompt}<|im_end|><|im_start|>assistant"
+    templated_prompt = f"<|im_start|>user {prompt} /no_think<|im_end|><|im_start|>assistant"
 
     parts = [
         f"cd {DEVICE_DIR} &&",

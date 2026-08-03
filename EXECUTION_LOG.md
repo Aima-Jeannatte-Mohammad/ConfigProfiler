@@ -237,7 +237,16 @@ Run réel confirmé : `prefill_duration_ms=178`, `decode_duration_ms=2333` — c
 
 **✅ Confirmé sur device réel** : 7 échantillons obtenus (vs 4 avant l'optimisation) sur une inférence similaire — gain conforme à l'attendu (quasi doublement). Nouvelle série observée : `[0.22s→1.27W], [0.88s→2.54W], [1.58s→3.40W], [2.30s→8.22W], [2.99s→9.47W], [3.71s→8.22W], [4.38s→8.18W]` — rampe de montée en charge progressive et lisible, cohérente avec chargement/initialisation puis régime de calcul soutenu. Bon candidat de figure pour le write-up (avec la réserve d'interprétation de phase déjà documentée ci-dessus).
 
+### Décision tranchée — mode thinking Qwen3 désactivé via soft switch `/no_think`
+
+TODO en attente depuis hier, tranché aujourd'hui. Raisons : pollue la démo vidéo (séquence C, la plus différenciante) et fausse les métriques tokens/latence du dataset de fidélité jargon sans apporter de valeur — le projet mesure la fidélité de traduction, pas la qualité du raisonnement interne.
+
+**Implémentation** : le hard switch (`enable_thinking=False`) est une option Python côté tokenizer HuggingFace (`apply_chat_template`), inaccessible depuis le runner C++ qui construit le prompt en texte brut. Solution retenue : soft switch textuel `/no_think` ajouté à la fin du message utilisateur dans le chat template (`build_llama_main_command`). Confirmé applicable à Qwen3 standard (pas Qwen3-VL, pas Qwen3.5, qui ont un comportement différent sur ce point — vérifié par recherche avant implémentation, pas supposé).
+
+**Testé** : syntaxe de commande vérifiée (`/no_think` bien injecté dans le prompt templaté). **Pas encore testé sur device réel que le thinking disparaît vraiment de la sortie** — à confirmer au prochain run, avant de considérer ce point définitivement clos.
+
 ### ⚠️ Points de vigilance actifs — à ne pas oublier pour la suite
+
 
 
 
