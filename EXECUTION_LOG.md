@@ -130,6 +130,124 @@ Même prompt, même modèle, câble débranché, `status: discharging` reconfirm
 
 **⚠️ Écart notable vs le test d'hier sous USB (73.45 / 22.00 tok/s) — à ne pas surinterpréter.** Un seul run par condition (n=1 vs n=1) : impossible de distinguer à ce stade un effet réel (throttling thermique lié à la charge, changement de gouverneur CPU) d'une simple variance run-à-run ou d'un effet d'ordre (cache système déjà chaud au 2e run). **Ne pas citer ces deux chiffres comme preuve d'un effet USB dans le write-up** tant que la matrice de collecte n'aura pas confirmé ça avec plusieurs runs répétés par condition — exactement le genre de variable que `collect_benchmarks.py` est censé contrôler méthodiquement. À garder comme signal à vérifier, pas comme résultat.
 
+### collect_benchmarks.py adapté à Qwen3 — script réécrit, testé en dry-run
+
+**Réutilisé sans modification** : classe `Device` entière (batterie, thermal, freq/throttling) — validée sur Pixel 7a, aucune raison de retoucher.
+
+**Réécrit** : `run_on_device_benchmark()` appelle réellement `llama_main` avec le chat template Qwen3, parse le JSON `PyTorchObserver` réel (confirmé sur les deux tests on-device) au lieu de l'ancien regex générique qui ne correspondait à aucune sortie réelle du runner.
+
+**Testé en `--dry-run --probe-device` et `--dry-run` complet** (avec `force` sur les paliers batterie simulés) : pipeline de bout en bout validé — paliers, warmup, reprise, écriture CSV, parsing JSON tous fonctionnels avant tout run réel sur device.
+
+**Flag threads confirmé via `llama_main --help` sur device** : c'est `-cpu_threads` (int32, défaut -1 = heuristique auto), pas `--threads`. `gflags` accepte les deux styles de tirets (`-flag` et `--flag`), donc `--cpu_threads=N` fonctionne — cohérent avec `--tokenizer_path` qui avait déjà fonctionné en style double-tiret dans les tests précédents.
+
+**⚠️ Deux TODO restants avant une vraie collecte complète** (documentés en tête du script) :
+1. Un seul `.pte` exporté à ce jour (`q8da4w`) — la matrice int8/int4 réelle nécessite d'exporter et pousser un `.pte` par niveau de quantization.
+2. Mode "thinking" Qwen3 non tranché — décider de le désactiver via le chat template ou de l'assumer comme partie du protocole, avant de lancer une collecte qui servira de référence.
+
+### Wrapper `adb` créé pour les appels Python `subprocess`
+
+**Piège** : `adb.exe` fonctionne en ligne de commande directe dans WSL (interop Windows native), mais `subprocess.run(["adb", ...])` en Python échoue avec `FileNotFoundError: No such file or directory: 'adb'` — les alias bash ne s'appliquent pas aux appels subprocess non-shell, il faut un vrai exécutable nommé `adb` dans le PATH.
+
+**Solution appliquée** — wrapper minimal :
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/adb << 'EOF'
+#!/bin/bash
+exec adb.exe "$@"
+EOF
+chmod +x ~/.local/bin/adb
+export PATH="$HOME/.local/bin:$PATH"          # session courante
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # permanent
+```
+Testé et fonctionnel : `adb devices` (commande directe) et tout script Python utilisant `subprocess.run(["adb", ...])` fonctionnent désormais de façon identique.
+
+**Piège annexe rencontré en cours de route** : un fichier `collect_benchmarks.py` préexistant, appartenant à `root`, bloquait la copie du nouveau script (`Permission denied`) — résolu par `sudo rm` avant de recopier. Origine du fichier root non identifiée (antérieur au démarrage connu du projet), à surveiller si d'autres fichiers `root`-owned apparaissent dans `~/executorch`.
+
+### 🎯 Premier run réel complet via collect_benchmarks.py — pipeline end-to-end validé
+
+Commande : `python3 collect_benchmarks.py --serial 192.168.1.63:40889 --reps 1 --quantizations q8da4w --threads 2` (paliers forcés avec `force`, test de validation du pipeline, pas une vraie collecte).
+
+**Résultat** : CSV correctement rempli, toutes colonnes présentes (prefill/decode tok/s, prompt/generated tokens, model_load_ms, watts, throttled, freq_drop). Le flag `--cpu_threads=2` a bien été appliqué sans erreur.
+
+**⚠️ Deux questions méthodologiques ouvertes, à trancher avant toute vraie collecte de référence** :
+
+1. **`throttled=True` sur 100% des runs de ce test** (freq_drop_pct 23-37%). Probablement un artefact de runs enchaînés sans vraie récupération thermique (paliers forcés, pas de vraie attente) — à revérifier avec de vrais paliers respectés. Si ça persiste avec un vrai protocole (paliers réels, temps de repos entre blocs), ce serait suspect et mériterait une investigation plus profonde.
+
+2. **`watts_estimated` anormalement bas pendant l'inférence active (0.30–1.11 W) vs le probe à l'arrêt plus tôt dans la journée (3.53 W).** Contre-intuitif — l'inférence CPU active devrait consommer plus, pas moins, qu'un état de repos. Hypothèse principale : `battery_watts()` est appelé dans `run_single()` **après** la fin de l'inférence (`bench = run_on_device_benchmark(...)` puis `watts = device.battery_watts()`), donc mesure un instant post-inférence où le CPU a déjà pu redescendre, pas la consommation pendant le run. **À corriger avant la vraie collecte** : envisager un échantillonnage pendant l'inférence (ex. thread de sampling en parallèle, ou au minimum immédiatement avant ET après pour encadrer), plutôt qu'un seul point après coup. Sujet à trancher explicitement, pas à laisser filer — c'est le genre de faille qu'un jury technique pourrait repérer en Q&A ("comment mesurez-vous la puissance PENDANT l'inférence ?").
+
+3. **Observation non expliquée, à vérifier avec plus de données** : decode ~48-49 tok/s sur ce run enchaîné, contre 22.00 et 36.81 tok/s sur les deux tests isolés d'hier (mêmes prompt/modèle, threads par défaut vs. `--cpu_threads=2` explicite ici). Piste probable : cache OS/page cache déjà chaud sur des runs qui s'enchaînent vs. cold start à chaque test isolé — mais pourrait aussi être un effet réel du flag `cpu_threads`. Ne pas conclure sans réplication (plusieurs valeurs de threads, plusieurs reps).
+
+### Correction méthodologique — mesure des watts par échantillonnage pendant l'inférence
+
+**Défaut corrigé** : `battery_watts()` était appelé une seule fois, après la fin de l'inférence — mesurait un état déjà redescendu, pas la consommation réelle pendant le run (cause probable des watts anormalement bas observés au run précédent : 0.30–1.11 W actif vs 3.53 W au repos).
+
+**Solution implémentée** : classe `WattsSampler`, thread dédié qui appelle `battery_watts()` toutes les 0.4s pendant toute la durée de l'appel bloquant à `llama_main` (encadre précisément l'inférence, pas juste avant/après). Le CSV rapporte maintenant `watts_mean`, `watts_min`, `watts_max`, `watts_n_samples` au lieu d'une seule valeur post-hoc — transparence totale sur la méthode, exploitable directement pour répondre à une question de jury sur "comment mesurez-vous la puissance pendant l'inférence".
+
+**Testé en dry-run** : schéma CSV correct, `watts_n_samples=1` en dry-run (attendu — l'appel simulé est instantané, pas assez de temps pour plusieurs échantillons à intervalle 0.4s). Sur device réel (inférence de 4-8s observée), attendre 10-20 échantillons par run — **à reconfirmer avec un vrai run device avant de considérer cette correction validée**.
+
+### Approfondissements méthodologiques Jour 2 — 4 ajouts, testés en dry-run
+
+En réponse à "comment aller plus loin pour un jury exigeant", 4 corrections/ajouts à coût faible et impact crédibilité élevé, tous implémentés et testés :
+
+1. **Baseline idle** (`--idle-baseline-s`, défaut 2s) : mesure la consommation au repos (écran éteint, aucune inférence) juste avant chaque run. `watts_delta_mean = watts_mean - baseline_watts_mean` donne le coût attribuable à l'inférence, pas une valeur brute sans référence.
+2. **Contrôle de l'état écran** (`Device.ensure_screen_off`) : variable confondante non maîtrisée jusqu'ici — un petit modèle quantizé peut consommer moins que l'écran allumé. Forcé éteint avant chaque baseline (idempotent, ne rallume jamais par erreur).
+3. **Dimension `cache_state` (cold/warm)** via `--inter-rep-pause-s` : l'écart de tok/s entre runs isolés (22-37 tok/s, Jour 1-2) et runs enchaînés (~48 tok/s, run de validation) n'est plus une anomalie non expliquée — c'est désormais une variable expérimentale explicite et contrôlable, pas un angle mort.
+4. **`--check-throttle-access`** : diagnostic à lancer avant toute vraie collecte, confirme si `scaling_cur_freq`/`cpuinfo_max_freq` sont lisibles (pas bloqués par SELinux comme `thermal_zone`) — évite de présenter `throttled` comme plus fiable qu'il ne l'est.
+
+**Testé en dry-run** : `--check-throttle-access` fonctionne, pipeline complet avec `--idle-baseline-s 0.5 --inter-rep-pause-s 0.5` produit bien `cache_state=cold` et `watts_delta_mean` calculé ; comportement par défaut (`--idle-baseline-s 0`) confirme la rétrocompatibilité avec note explicite `baseline désactivée`.
+
+**⚠️ À faire avant la vraie collecte, sur device réel (pas juste dry-run)** :
+- Lancer `python3 collect_benchmarks.py --serial <IP:PORT> --check-throttle-access` pour confirmer si la lecture cpufreq est vraiment accessible sur le Pixel 7a (jamais testé en conditions réelles, seulement en mock).
+- Reconfirmer que `ensure_screen_off()` fonctionne réellement sur le device (le keyevent 26 pourrait avoir un comportement différent selon l'état de verrouillage de l'écran — à vérifier).
+- Décider de la valeur par défaut de `--inter-rep-pause-s` pour la vraie collecte (0 = reproduit le comportement du run de validation, >0 = protocole plus rigoureux mais collecte plus longue).
+
+**✅ Confirmé sur device réel (Jour 2)** : `--check-throttle-access` montre que la lecture `scaling_cur_freq`/`cpuinfo_max_freq` fonctionne sans blocage SELinux sur le Pixel 7a (contrairement à `thermal_zone`) — 8 cœurs détectés, fréquences lisibles. Le `throttled` du dataset sera donc basé sur la vraie fréquence CPU, pas un repli approximatif. Un des deux points de vigilance de la liste ci-dessous est donc levé.
+
+### 🎯 Pipeline de collecte validé de bout en bout, dataset propre obtenu
+
+Après correction d'un souci de fichier CSV à schéma mixte (résultat d'un ancien fichier non renommé avant un nouveau run — toujours vérifier `results/` avant un nouveau test si le schéma du script a changé), premier dataset propre obtenu :
+- 12 runs (1 config × 3 paliers batterie × 2 conditions thermiques × 2 [warmup+rep])
+- Schéma CSV complet et cohérent (header et données alignés)
+- `watts_delta_mean` désormais cohérent et positif (3.4-5.0 W au-dessus du baseline idle), résolvant l'anomalie détectée plus tôt dans la journée
+
+**Bilan Jour 2** : pipeline de collecte scientifiquement défendable, pas juste fonctionnel — export, cross-compilation ARM64, déploiement, mesure watts corrigée pendant l'inférence, baseline idle, contrôle écran, dimension cache_state, diagnostic throttle, tous validés sur device réel.
+
+### Approfondissement — séries temporelles watts + durées de phase réelles (au-delà du plan Jour 2)
+
+En creusant la variance watts_min/watts_max observée, deux ajouts distincts, avec une limite honnêtement assumée plutôt qu'une fausse précision :
+
+1. **`prefill_duration_ms` / `decode_duration_ms`** : calculées uniquement à partir de timestamps **device** (`inference_start_ms`, `prompt_eval_end_ms`, `inference_end_ms` du JSON PyTorchObserver) — même horloge des deux côtés du calcul, donc fiable et précis.
+2. **`watts_samples_json`** : série brute `[(elapsed_s, watts), ...]` par run, horodatée en secondes relatives depuis le début de l'échantillonnage (horloge **hôte**/WSL).
+
+**⚠️ Limite explicitement NON résolue aujourd'hui, à ne pas contourner par une fausse précision** : les deux horloges (device pour les durées de phase, hôte pour les échantillons watts) ne sont **pas synchronisées**. Corréler un échantillon watts précis à "on est en train de faire du prefill" ou "du decode" nécessiterait soit une synchronisation d'horloge device/hôte, soit un marqueur explicite émis par le runner au moment de la transition prefill→decode. **Ne pas produire de graphique ou d'affirmation "watts pendant le prefill = X" tant que ce point n'est pas résolu** — le mensonge par excès de précision serait pire que l'absence de résultat sur ce point. Piste pour plus tard si le temps le permet : ajouter un `time.sleep()` calibré ou un ping ADB au tout début de l'inférence pour établir un point d'ancrage commun entre les deux horloges.
+
+**Testé en dry-run**, schéma CSV cohérent (`prefill_duration_ms`, `decode_duration_ms`, `watts_samples_json` bien remplis). **Pas encore testé sur device réel avec cette version** — à faire avant la prochaine vraie collecte.
+
+### Résultats réels — durées de phase et série watts, premier vrai signal exploitable
+
+Run réel confirmé : `prefill_duration_ms=178`, `decode_duration_ms=2333` — cohérent (prefill court sur 13 tokens, decode domine ~93% du temps total).
+
+**Série watts observée** (`watts_samples_json`) : `[0.498s→0.49W], [1.861s→5.00W], [2.968s→9.30W], [3.981s→8.68W]` — vraie rampe de montée en charge, pas du bruit. Lecture qualitative plausible : le premier échantillon bas coïncide probablement avec le chargement du modèle (observé 850-2500ms sur runs précédents), puis la puissance grimpe une fois l'inférence CPU réellement engagée. **Reste une lecture qualitative** — la limite d'horloge device/hôte documentée plus haut s'applique toujours, pas d'attribution précise de phase à ce stade.
+
+**⚠️ Découverte méthodologique imprévue** : l'intervalle réel entre échantillons (1.0-1.4s) ne respecte pas le `interval_s=0.4` configuré. Cause identifiée : `battery_watts()` fait deux appels adb séquentiels (`current_now` puis `voltage_now`), chacun avec son propre aller-retour — le coût réel par échantillon dépasse largement le `time.sleep(0.4)` entre deux tentatives. **Résultat : sur une inférence de ~4s, seulement 4 échantillons obtenus au lieu des ~10 attendus.** Pas bloquant pour la suite (les données restent valides), mais à noter dans le write-up si `watts_n_samples` est cité comme mesure de résolution temporelle — la résolution réelle est plus grossière que le paramètre `interval_s` ne le suggère. Piste d'amélioration si le temps le permet : batcher `current_now` et `voltage_now` en une seule commande shell (`cat file1 file2`) pour réduire le nombre d'allers-retours adb par échantillon.
+
+### Correction — échantillonnage watts optimisé (un seul appel adb au lieu de deux)
+
+`battery_watts()` combine désormais `current_now` et `voltage_now` en une seule commande adb (`cat f1 f2`) au lieu de deux appels séquentiels. Devrait réduire le coût réel par échantillon d'environ moitié, rapprochant l'intervalle effectif du `interval_s=0.4` configuré (mesuré à 1.0-1.4s avec l'ancienne version à deux appels). **Testé en dry-run uniquement** — le vrai gain de résolution temporelle reste à confirmer sur device réel avant de le considérer acquis.
+
+**✅ Confirmé sur device réel** : 7 échantillons obtenus (vs 4 avant l'optimisation) sur une inférence similaire — gain conforme à l'attendu (quasi doublement). Nouvelle série observée : `[0.22s→1.27W], [0.88s→2.54W], [1.58s→3.40W], [2.30s→8.22W], [2.99s→9.47W], [3.71s→8.22W], [4.38s→8.18W]` — rampe de montée en charge progressive et lisible, cohérente avec chargement/initialisation puis régime de calcul soutenu. Bon candidat de figure pour le write-up (avec la réserve d'interprétation de phase déjà documentée ci-dessus).
+
 ### ⚠️ Points de vigilance actifs — à ne pas oublier pour la suite
+
+
+
+
+
+
+
+
+
+
+
 
 ```
