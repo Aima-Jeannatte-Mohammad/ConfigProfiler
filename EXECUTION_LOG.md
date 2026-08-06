@@ -245,7 +245,78 @@ TODO en attente depuis hier, tranché aujourd'hui. Raisons : pollue la démo vid
 
 **Testé** : syntaxe de commande vérifiée (`/no_think` bien injecté dans le prompt templaté). **Pas encore testé sur device réel que le thinking disparaît vraiment de la sortie** — à confirmer au prochain run, avant de considérer ce point définitivement clos.
 
+**✅ Confirmé sur device réel** : le soft switch `/no_think` fonctionne — le modèle ne génère plus de contenu de raisonnement (0 token gaspillé sur le thinking), réponse directe. **Nuance à noter** : les balises `<think>\n</think>` restent présentes dans le texte brut, mais vides — comportement documenté du soft switch (contrairement au hard switch qui les supprimerait entièrement). Si affichage du texte brut dans la démo vidéo, prévoir un nettoyage cosmétique simple (regex `<think>\s*</think>\s*` → vide) pour un rendu propre. Pas bloquant, juste à anticiper pour le tournage.
+
+## Jour 3 — 4 août 2026
+
+### Détection du Mode Économie d'énergie (Battery Saver) — variable cachée non contrôlée
+
+En affinant la question des paliers batterie, découverte importante : **le seuil par défaut d'activation automatique du Battery Saver sur Pixel est 20%** — exactement la borne du palier "low" (`<20%`) du script. Si actif, ce mode bride le CPU et coupe des activités en arrière-plan — mesurer "batterie basse" sans savoir si ce mode est actif mélangerait deux effets confondus (niveau de batterie réel + throttling logiciel volontaire) dans une seule étiquette.
+
+**Décision retenue (Option A)** : isoler l'effet batterie seul en désactivant manuellement l'activation automatique du Battery Saver avant la collecte (Paramètres → Batterie → Économiseur de batterie → Programmation et rappels), plutôt que de le documenter comme faisant partie du palier "low". Raison : le projet mesure l'effet matériel brut de la batterie, pas l'effet d'un mode logiciel — plus simple et plus clair à défendre devant un jury.
+
+**Implémentation** : `Device.is_battery_saver_active()` (lecture `settings get global low_power`), nouvelle colonne CSV `battery_saver_active`, avertissement console immédiat si détecté actif pendant un run (pas de désactivation automatique tentée via adb — permissions non garanties, décision laissée à l'utilisateur). **Testé en dry-run uniquement** — à vérifier sur device réel avant la vraie collecte du jour, en particulier confirmer manuellement que le Battery Saver est bien désactivé avant de lancer la matrice complète.
+
+### Dataset fidélité jargon — corpus + script de scoring créés, garde-fou méthodologique ajouté
+
+**Livrables** : `jargon_dataset_corpus.csv` (30 phrases jargon EN utilisant le vocabulaire réel du projet — ExecuTorch, XNNPACK, KleidiAI, quantization, tokenizer, thermal throttling... + 30 phrases contrôle neutres), `score_jargon_fidelity.py` (scoring automatique par correspondance glossaire, méthode tranchée : objective + relecture manuelle en filet de sécurité pour les faux négatifs).
+
+**Décision sur la direction de traduction** : EN→FR uniquement (pas les deux sens) — cohérent avec l'anecdote personnelle franglais, et le jargon anglais resurgissant au milieu du français reste repérable par un jury anglophone sans qu'il ait besoin de lire le français.
+
+**Question méthodologique soulevée en cours de projet, corrigée avant toute collecte réelle** : garder le jargon intact est une pratique de traduction professionnelle légitime (pas un échec), MAIS un modèle qui échoue totalement à traduire (recopie pure de l'anglais, scénario plausible sous quantization sévère) obtiendrait un score de "préservation" parfait sans garde-fou — confondant "traduction réussie avec jargon préservé" et "aucune traduction du tout". **Ajouté** : `looks_translated` (détection de mots grammaticaux français courants), qui signale explicitement les cas `all_preserved=True` + `looks_translated=False` comme des recopies suspectes à exclure, pas de vrais succès. Testé avec un cas de recopie pure simulée — le garde-fou déclenche correctement l'alerte.
+
+**⚠️ Reste à faire** : générer les vraies traductions sur device (adapter le prompt `llama_main` pour une tâche de traduction plutôt qu'une question factuelle) avant de pouvoir lancer un vrai scoring.
+
+### 🐛 Bug méthodologique découvert dans le dataset de référence — throttled=100% suspect, corrigé
+
+Le dataset de référence (36 runs, low/mid/high, vrais paliers) montrait `throttled=True` sur **100% des runs**, sans variation cohérente avec les conditions — signal suspect plutôt qu'un vrai résultat scientifique. `freq_drop_pct` variait 23-44%, avec une légère tendance low > high (36.9% vs 30.5%, possible vrai signal de fond, mais amplitude bien trop grande pour être uniquement thermique).
+
+**Cause identifiée** : `_cpu_freqs()` lisait toutes les fréquences courantes et tous les plafonds théoriques en deux listes séparées, puis comparait `max(cur global)` à `max(max global)` — sur l'architecture big.LITTLE du Tensor G2 (LITTLE ~1.8GHz, BIG ~2.85GHz), ça revenait à comparer un cœur LITTLE actif à son propre plafond... contre le plafond du cœur BIG inactif. Résultat : une "chute" artificiellement énorme même sans surchauffe réelle, simplement parce qu'un petit modèle sur 2-4 threads ne sollicite jamais les cœurs BIG.
+
+**Correction** : lecture appariée cœur par cœur (`cur, max` sur la même ligne, même index), sélection du cœur **le plus actif** (`cur` le plus élevé), calcul du drop sur SON PROPRE plafond uniquement. Testé en dry-run avec un mock simulant explicitement 4 cœurs LITTLE actifs + 4 cœurs BIG inactifs — confirme que le nouveau calcul sélectionne bien le cœur pertinent (`drop=5.56%`, cohérent) plutôt que le mélange entre clusters (`throttled=False` désormais en conditions normales).
+
+**⚠️ Conséquence directe : le dataset de 36 runs collecté avant cette correction a une colonne `throttled`/`freq_drop_pct` non fiable.** Les autres colonnes (tok/s, watts, cache_state, battery_saver_active...) restent valides — seul le signal de throttling est à refaire. **Décision à prendre** : soit relancer la collecte complète avec le script corrigé (coût : refaire les 3 paliers, potentiellement plusieurs heures), soit publier le dataset actuel en excluant/annotant explicitement la colonne throttled comme non fiable dans cette version. Pas encore tranché — à décider avant de committer le dataset comme référence finale.
+
+### Script de génération des traductions — `translate_jargon_dataset.py`, créé et testé
+
+Réutilise `Device`/`run_on_device_benchmark` de `collect_benchmarks.py` (import local, pas de duplication) pour envoyer chaque phrase du corpus à `llama_main` avec une instruction de traduction EN→FR, `/no_think` actif, produit un CSV directement compatible avec `score_jargon_fidelity.py`.
+
+**Piège d'extraction identifié et testé AVANT tout run réel** : la sortie brute contient l'artefact de collage déjà observé Jour 2 (`"assistantius"` — le premier token généré se colle parfois au marqueur `<|im_start|>assistant` sans espace). Extraction conçue pour couper après `</think>` plutôt qu'après le marqueur assistant, précisément pour éviter ce piège. **Testé avec le vrai exemple de sortie problématique du Jour 2** (copié tel quel depuis les logs) — extraction propre confirmée, artefact correctement écarté.
+
+**Testé en dry-run** : logique de reprise (skip des lignes déjà traduites) fonctionnelle, CSV bien formé. Le mock de `collect_benchmarks.py` ne simule que la ligne JSON de métriques, pas de vrai texte — donc le dry-run valide la mécanique (arguments, reprise, écriture CSV) mais pas le contenu réel des traductions ; premier vrai test de contenu à faire sur device.
+
+**⚠️ Reste à faire** : premier run réel sur device (`--limit 3` recommandé pour valider avant de lancer les 60 phrases complètes), puis lancement complet une fois confirmé propre.
+
+## Jour 4 (soir Jour 3 / nuit) — Preuve d'optimisation Arm-spécifique (Trou 1)
+
+### 🎯🎯🎯 Résultat majeur — comparaison fp32 naïf vs 8da4w+XNNPACK+KleidiAI sur device réel
+
+**Contexte** : suite aux clarifications répétées du jury officiel ("prove one clear thing: what you did that makes AI better on Arm"), export et test d'une baseline fp32 naïve (aucune quantization, aucun backend Arm-spécifique) pour comparer directement à la config optimisée déjà validée.
+
+**Étapes** :
+1. Config `qwen3_portable_q8da4w.yaml` créée (quantization 8da4w SANS backend XNNPACK) — testée d'abord sur WSL : **échec runtime** (`Check failed: Tensors do not match: dtype={Float, Char, Float}`). Confirme que la représentation `IntxUnpackedToInt8Tensor` produite par la quantization 8da4w est structurellement dépendante des kernels XNNPACK — aucun kernel portable ne sait l'exécuter. Résultat gardé comme preuve à part entière ("capacité qui n'existe pas sans le backend Arm"), pas caché.
+2. Config `qwen3_naive_fp32.yaml` créée (aucune quantization, aucun backend) — export réussi, `.pte` de **2 388 733 316 octets (2.39 Go)** vs **468 633 472 octets (468 Mo)** pour la version optimisée. **Ratio de taille : 5.1x**.
+3. Test WSL (x86, non représentatif Arm) : 11.88 tok/s — cohérent avec l'attente que la quantization n'apporte aucun gain sans hardware Arm pour l'exploiter.
+4. **Blocage stockage device** : Pixel 7a à 100% (981 Mo libres sur 110 Go) — push du `.pte` naïf (2.39 Go) impossible. Espace libéré manuellement par l'utilisateur (24 Go dispo après nettoyage) — noté comme point de storytelling honnête en soi (un modèle non quantizé ne tient même pas sur un téléphone grand public presque plein, un scénario réaliste, pas un artefact de benchmark).
+5. **Test réel sur Pixel 7a (Tensor G2), fp32 naïf** :
+   - `prefill_token_per_sec: 1.02762`, `decode_token_per_sec: 0.0779361`
+   - 54 tokens générés en **709.1 secondes** (`aggregate_model_execution_time_ms: 709111`) — soit ~12.8s/token.
+
+**Comparaison avec le résultat optimisé déjà mesuré (Jour 2, conditions propres Wi-Fi/discharging)** : 103.17 / 36.81 tok/s (prefill/decode).
+
+**→ Gain mesuré : ~100x en prefill, ~472x en decode.**
+
+**Réplication (run 2, mêmes conditions)** : `prefill_token_per_sec: 1.68701`, `decode_token_per_sec: 0.102846`. Ordre de grandeur confirmé malgré variance run-à-run normale (~50%, plausible thermique/bruit) — **moyenne sur les 2 runs : prefill 1.36 tok/s, decode 0.090 tok/s naïf, contre 103.17/36.81 optimisé → gain ~76x en prefill, ~407x en decode.** Conclusion robuste, réplication validée.
+
+**Valeur stratégique** : répond directement et de façon spectaculaire à la question centrale du jury ("what did you do that specifically makes this better on Arm"), et correspond explicitement à un des exemples cités dans leur grille ("making something run on a constrained device that previously required more" / "unlock a use case that was not previously practical") — le modèle naïf n'est pas seulement plus lent, il est impraticable (>11 min pour une réponse courte).
+
 ### ⚠️ Points de vigilance actifs — à ne pas oublier pour la suite
+
+
+
+
+
+
 
 
 
